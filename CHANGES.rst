@@ -1,6 +1,21 @@
 Latest changes
 ==============
 
+Release 1.5.3 - unreleased
+--------------------------
+
+Memory:
+~~~~~~~
+
+- Add ``MemorizedResult.pin()``, returning a hold handle that keeps a cached
+  result alive across processes.  Holds survive cache invalidation and are
+  honoured by cache maintenance, ``Memory.clear``, ``MemorizedFunc.clear``
+  and ``MemorizedResult.clear`` (which raise the new ``CacheInUseError``
+  before deleting anything).  ``Memory.reduce_size`` now returns whether the
+  requested limits were reached.  Hold handles can be passed to
+  ``Parallel`` tasks (``n_jobs=1``, ``threading`` and ``loky``) and keep the
+  result protected until the task completes, including failure paths.
+
 Release 1.5.2 - 2025/08/27
 --------------------------
 

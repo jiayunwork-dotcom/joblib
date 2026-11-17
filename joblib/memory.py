@@ -24,7 +24,12 @@ import traceback
 import warnings
 import weakref
 
-from . import hashing
+from . import _result_holds, hashing
+from ._result_holds import (
+    CacheInUseError,  # noqa: F401
+    HoldNotSupportedError,
+    ResultHold,
+)
 from ._store_backends import (
     CacheWarning,  # noqa
     FileSystemStoreBackend,
@@ -249,6 +254,54 @@ class MemorizedResult(Logger):
             )
             raise new_exc from exc
 
+    def pin(self):
+        """Protect this cached result and return a hold handle.
+
+        The returned handle provides ``get()``, ``close()`` and the context
+        manager protocol.  While at least one handle (including handles
+        transferred to :class:`~joblib.Parallel` tasks) is alive, cache
+        maintenance and cache invalidation cannot remove the underlying
+        cached result.
+
+        ``pin()`` is atomic with respect to cache maintenance: it either
+        protects the exact value present when it was called, or raises
+        ``KeyError`` if that value was already removed.  A later computation
+        at the same cache path does not take over the protection.
+
+        Returns
+        -------
+        hold: ResultHold
+            Handle on the cached value.  ``get()`` honours the result's
+            ``mmap_mode``.
+        """
+        _result_holds.require_holds("MemorizedResult.pin()")
+        if not getattr(self.store_backend, "supports_holds", False):
+            raise HoldNotSupportedError(
+                "The store backend of this result does not support holds."
+            )
+        rel_path = _result_holds.relative_item_path(self._call_id)
+        with _result_holds.store_lock(self.store_backend.location, exclusive=False):
+            item_path = os.path.join(self.store_backend.location, rel_path)
+            identity = _result_holds.identity_of_item(item_path)
+            if identity is None:
+                raise KeyError(
+                    "Cannot pin a MemorizedResult whose value is not present "
+                    f"in the cache: {item_path}"
+                )
+            lease = _result_holds.create_lease(
+                self.store_backend.location, rel_path, identity
+            )
+        return ResultHold(
+            self.store_backend,
+            rel_path,
+            identity,
+            mmap_mode=self.mmap_mode,
+            verbose=self.verbose,
+            timestamp=self.timestamp,
+            metadata=self.metadata,
+            lease=lease,
+        )
+
     def clear(self):
         """Clear value from cache"""
         self.store_backend.clear_item(self._call_id)
@@ -281,6 +334,13 @@ class NotMemorizedResult(object):
             return self.value
         else:
             raise KeyError("No value stored.")
+
+    def pin(self):
+        """Holding is not supported when caching is disabled."""
+        raise HoldNotSupportedError(
+            "Cannot pin a NotMemorizedResult: no cache is configured for this "
+            "function (Memory(location=None)). There is nothing to protect."
+        )
 
     def clear(self):
         self.valid = False
@@ -479,7 +539,9 @@ class MemorizedFunc(Logger):
             self.cache_validation_callback is not None
             and not self.cache_validation_callback(metadata)
         ):
-            self.store_backend.clear_item(call_id)
+            # The value is declared invalid: it must not be returned as a hit
+            # anymore, but an actively held copy must remain readable.
+            self.store_backend.invalidate_item(call_id)
             return False
 
         return True
@@ -783,7 +845,9 @@ class MemorizedFunc(Logger):
                     func_name, self.func_id
                 )
             )
-        self.clear(warn=True)
+        # Results held by consumers stay readable, so the cache is
+        # invalidated rather than unconditionally deleted.
+        self.invalidate()
         return False
 
     def clear(self, warn=True):
@@ -792,6 +856,24 @@ class MemorizedFunc(Logger):
         if self._verbose > 0 and warn:
             self.warn("Clearing function cache identified by %s" % func_id)
         self.store_backend.clear_path(
+            [
+                func_id,
+            ]
+        )
+
+        func_code, _, first_line = self.func_code_info
+        self._write_func_code(func_code, first_line)
+
+    def invalidate(self):
+        """Invalidate the function's cache, keeping actively held values.
+
+        Unlike :meth:`clear`, this does not fail when some results are held:
+        it moves them aside so their holders keep reading them.  This is used
+        when the function code changed or when the user invalidates the
+        cache, in which case old results must not be returned as hits.
+        """
+        func_id = self.func_id
+        self.store_backend.invalidate_path(
             [
                 func_id,
             ]
@@ -905,6 +987,7 @@ class MemorizedFunc(Logger):
         return MemorizedResult(
             self.store_backend,
             call_id,
+            mmap_mode=self.mmap_mode,
             metadata=metadata,
             timestamp=self.timestamp,
             verbose=self._verbose - 1,
@@ -1164,17 +1247,28 @@ class Memory(Logger):
             time ago are deleted. Example: to remove files older than 5 days,
             use datetime.timedelta(days=5). Negative timedelta are not
             accepted.
+
+        Returns
+        -------
+        limits_reached: bool
+            ``True`` if the cache now fits the requested limits.  ``False``
+            means some actively held results (see
+            :meth:`MemorizedResult.pin`) prevented the cache from reaching
+            the target; they are kept and will become reclaimable by a later
+            maintenance call once their last holder exits.
         """
         if self.store_backend is None:
             # No cached results, this function does nothing.
-            return
+            return True
 
         if bytes_limit is None and items_limit is None and age_limit is None:
             # No limitation to impose, returning
-            return
+            return True
 
         # Defers the actual limits enforcing to the store backend.
-        self.store_backend.enforce_store_limits(bytes_limit, items_limit, age_limit)
+        return self.store_backend.enforce_store_limits(
+            bytes_limit, items_limit, age_limit
+        )
 
     def eval(self, func, *args, **kwargs):
         """Eval function func with arguments `*args` and `**kwargs`,

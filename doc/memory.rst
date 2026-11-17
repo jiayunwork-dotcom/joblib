@@ -239,6 +239,79 @@ python interpreter.
     copy-pasting feature.
 
 
+Protecting a cached value while it is being used
+------------------------------------------------
+
+A plain `MemorizedResult` is only a *reference*: cache maintenance
+(`Memory.reduce_size`), cache invalidation (a changed function, an
+invalidating `cache_validation_callback`) or an explicit
+`MemorizedResult.clear` may delete the underlying value at any time and
+a later `get` then raises `KeyError`.
+
+When a value must stay available while a consumer is still reading it,
+take a **hold** with `MemorizedResult.pin`::
+
+    >>> result = g.call_and_shelve(4)
+    >>> hold = result.pin()
+    >>> hold.get()  #doctest: +SKIP
+    array([...])
+
+A hold keeps the exact cached value alive, from any process, until
+`close` is called. It does **not** copy the value: `get` still reads the
+original cache file (memory-mapped when the result uses `mmap_mode`) and
+never recomputes the function. The hold is also a context manager::
+
+    >>> with result.pin() as hold:  #doctest: +SKIP
+    ...     value = hold.get()
+
+While at least one hold exists:
+
+* `Memory.reduce_size`, `Memory.clear`, `MemorizedFunc.clear` and
+  `MemorizedResult.clear` keep the value and, for maintenance, delete the
+  other candidates first. If the targets cannot be reached because a held
+  result must stay, `reduce_size` returns `False` instead of silently
+  claiming success.
+* Clearing a scope that contains a held result raises
+  `joblib.memory.CacheInUseError` *before* deleting anything.
+* Automatic invalidation (changed function code, validation callback) makes
+  the value a cache miss for new calls, but a held copy remains readable and
+  is **never** returned as a hit to new calls.
+
+Losing protection is explicit: `close` (idempotent) or leaving the
+context manager. A process crash or a killed worker releases the hold
+automatically (it relies on filesystem locks, not on a timeout), so cache
+maintenance can always reclaim unused values later. `get` on a closed
+hold raises `ResultReleasedError`, and a hold never returns a value
+recomputed at the same cache path after the pinned one was removed.
+
+Holding across a `Parallel` call
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Hold handles can be passed directly to :class:`~joblib.Parallel` tasks, or
+nested in `list`, `tuple` and `dict` arguments. Every accepted task keeps
+the protected value alive until it finishes, so the parent handle may be
+closed before the tasks are consumed::
+
+    >>> hold = result.pin()  #doctest: +SKIP
+    >>> generator = Parallel(  #doctest: +SKIP
+    ...     n_jobs=2, return_as="generator", pre_dispatch="all", batch_size=1
+    ... )(delayed(consume)(hold) for _ in range(10))
+    >>> hold.close()  # the queued and running tasks are still protected
+    >>> for output in generator:  #doctest: +SKIP
+    ...     ...
+
+This is supported for in-process execution (`n_jobs=1`), the `threading`
+backend and the `loky` backend with a local filesystem store. Other
+backends and store backends raise `HoldNotSupportedError` when the task is
+submitted, instead of silently dropping the protection. A task that
+closes its own handle does not release the protection of other tasks, and
+submitting a closed handle is rejected.
+
+Bare arrays returned by tasks do not carry any protection: if a caller
+needs to keep using them after the tasks ended, it must take and keep its
+own hold.
+
+
 Gotchas
 -------
 
@@ -523,6 +596,14 @@ without actually needing to call the function itself::
 
 .. autoclass:: MemorizedFunc
     :members: __init__, call, clear, check_call_in_cache
+
+.. autoclass:: MemorizedResult
+    :members: get, pin, clear
+
+.. autoclass:: ResultHold
+    :members: get, close
+
+.. autoexception:: CacheInUseError
 
 
 ..

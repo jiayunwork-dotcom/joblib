@@ -23,10 +23,10 @@ from multiprocessing import TimeoutError
 from numbers import Integral
 from uuid import uuid4
 
-from ._multiprocessing_helpers import mp
-
 # Make sure that those two classes are part of the public joblib.parallel API
 # so that 3rd party backend implementers can import them from here.
+from . import _result_holds
+from ._multiprocessing_helpers import mp
 from ._parallel_backends import (
     AutoBatchingMixin,  # noqa
     FallbackToBackend,
@@ -36,6 +36,7 @@ from ._parallel_backends import (
     SequentialBackend,
     ThreadingBackend,
 )
+from ._result_holds import HoldNotSupportedError
 from ._utils import _Sentinel, eval_expr
 from .disk import memstr_to_bytes
 from .logger import Logger, short_format_time
@@ -583,6 +584,26 @@ if hasattr(mp, "get_context"):
         DEFAULT_MP_CONTEXT = mp.get_context(method=method)
 
 
+# Backends able to execute tasks that use protected result holds.  The value
+# cached on disk is read by the worker process, so any local backend would
+# work in principle; the ones below are the explicitly supported set.
+HOLD_CAPABLE_BACKENDS = (SequentialBackend, ThreadingBackend, LokyBackend)
+
+
+def _check_parallel_holds_supported(backend, func=None):
+    """Reject unsupported execution backends before accepting a task."""
+    if not _result_holds.holds_supported():
+        raise HoldNotSupportedError(
+            "Parallel tasks using MemorizedResult.pin() holds require POSIX "
+            "file locking, which is not available on this platform."
+        )
+    if not isinstance(backend, HOLD_CAPABLE_BACKENDS):
+        raise HoldNotSupportedError(
+            "Backend {!r} does not support protected result holds. Use "
+            "n_jobs=1, the 'threading' backend or the 'loky' backend.".format(backend)
+        )
+
+
 class BatchedCalls(object):
     """Wrap a sequence of (func, args, kwargs) tuples as a single callable"""
 
@@ -710,6 +731,10 @@ class BatchCompletionCallBack(object):
         self.parallel_call_id = parallel._call_id
         self._completion_timeout_counter = None
 
+        # Leases reserved in the parent process for the result holds used by
+        # this batch.  They are released once the task outcome is known.
+        self.hold_leases = None
+
         # Internals to keep track of the status and outcome of the task.
 
         # Used to hold a reference to the future-like object returned by the
@@ -774,6 +799,15 @@ class BatchCompletionCallBack(object):
             return self._result
         finally:
             del self._result
+            # The task is over: whatever the outcome, the parent-side
+            # protection reserved for it is not needed anymore.
+            self.release_hold_leases()
+
+    def release_hold_leases(self):
+        """Release the leases held for this batch, if any."""
+        leases, self.hold_leases = self.hold_leases, None
+        if leases:
+            self.parallel._release_hold_leases(leases)
 
     def get_status(self, timeout):
         """Get the status of the task.
@@ -882,6 +916,11 @@ class BatchCompletionCallBack(object):
             self.status = outcome["status"]
 
         self._result = outcome["result"]
+
+        # The task is over from the parent's point of view: the resources it
+        # was using (including the reserved leases) can be released even if
+        # the error is only surfaced later in the main thread.
+        self.release_hold_leases()
 
         # Once the result and the status are extracted, the last reference to
         # the job can be deleted.
@@ -1360,6 +1399,9 @@ class Parallel(Logger):
         self._managed_backend = False
         self._id = uuid4().hex
         self._call_ref = None
+        # Leases reserved in this process for result holds used by tasks that
+        # have been accepted but not fully finished yet.
+        self._hold_leases = set()
 
     def __enter__(self):
         self._managed_backend = True
@@ -1416,6 +1458,7 @@ class Parallel(Logger):
         """
         # If job.get() catches an exception, it closes the queue:
         if self._aborting:
+            self._release_hold_leases(getattr(batch, "_outer_leases", None))
             return
 
         batch_size = len(batch)
@@ -1426,6 +1469,7 @@ class Parallel(Logger):
         dispatch_timestamp = time.time()
 
         batch_tracker = BatchCompletionCallBack(dispatch_timestamp, batch_size, self)
+        batch_tracker.hold_leases = getattr(batch, "_outer_leases", None)
 
         self._register_new_job(batch_tracker)
 
@@ -1522,23 +1566,120 @@ class Parallel(Logger):
                     final_batch_size = max(1, len(islice) // n_jobs)
 
                 # enqueue n_jobs batches in a local queue
-                for i in range(0, len(islice), final_batch_size):
-                    tasks = BatchedCalls(
-                        islice[i : i + final_batch_size],
-                        self._backend.get_nested_backend(),
-                        self._reducer_callback,
-                        self._pickle_cache,
-                    )
-                    self._ready_batches.put(tasks)
+                try:
+                    for i in range(0, len(islice), final_batch_size):
+                        tasks = self._prepare_batch(islice[i : i + final_batch_size])
+                        self._ready_batches.put(tasks)
 
-                # finally, get one task.
-                tasks = self._ready_batches.get(block=False)
+                    # finally, get one task.
+                    tasks = self._ready_batches.get(block=False)
+                except BaseException as e:
+                    # A batch could not be prepared (typically because a
+                    # result hold used by a task has been closed). Register
+                    # the failure as a task error so that it is surfaced in
+                    # the caller's thread, and stop dispatching.
+                    self._register_dispatch_error(e, batch_size)
+                    return True
             if len(tasks) == 0:
                 # No more tasks available in the iterator: tell caller to stop.
                 return False
             else:
                 self._dispatch(tasks)
                 return True
+
+    def _register_dispatch_error(self, exc, batch_size):
+        """Surface an error raised while preparing a batch to the caller."""
+        # Stopping dispatch is enough: the retrieval loop is responsible for
+        # raising the registered error.
+        self._exception = True
+        self._aborting = True
+        batch_tracker = BatchCompletionCallBack(0, batch_size, self)
+        self._register_new_job(batch_tracker)
+        batch_tracker._register_outcome(dict(result=exc, status=TASK_ERROR))
+
+    def _prepare_batch(self, items):
+        """Build a batch, protecting the result holds it uses.
+
+        A lease is reserved *in the submitting process* for every handle
+        embedded in the task arguments.  It is released once the task
+        outcome is registered (success, user error, serialization failure or
+        abort), which is exactly the point where the task stops using the
+        result.  The handle sent to the worker is a detached *task view*
+        that reads the same value using the identity captured at submission
+        time.
+        """
+        new_items = []
+        leases = []
+        for func, args, kwargs in items:
+            new_args, args_originals = _result_holds.replace_holds(args)
+            new_kwargs, kwargs_originals = _result_holds.replace_holds(kwargs)
+            originals = args_originals + kwargs_originals
+            if originals:
+                _check_parallel_holds_supported(self._backend, func)
+                try:
+                    for hold in originals:
+                        leases.append(hold._reserve())
+                except BaseException:
+                    for lease in leases:
+                        lease.close()
+                    raise
+            new_items.append((func, new_args, new_kwargs))
+        tasks = BatchedCalls(
+            new_items,
+            self._backend.get_nested_backend(),
+            self._reducer_callback,
+            self._pickle_cache,
+        )
+        if leases:
+            # Kept off the pickle payload: the protection lives in this
+            # process (the worker only reads the cached value).
+            tasks._outer_leases = leases
+            with self._lock:
+                self._hold_leases.update(leases)
+        return tasks
+
+    def _release_hold_leases(self, leases):
+        """Close reserved leases and forget them."""
+        if not leases:
+            return
+        with getattr(self, "_lock", nullcontext()):
+            for lease in leases:
+                self._hold_leases.discard(lease)
+        for lease in leases:
+            try:
+                lease.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    def _prepare_sequential_task(self, args, kwargs):
+        """Transfer hold protection to a task run in the current process."""
+        new_args, args_originals = _result_holds.replace_holds(args)
+        new_kwargs, kwargs_originals = _result_holds.replace_holds(kwargs)
+        originals = args_originals + kwargs_originals
+        if not originals:
+            return args, kwargs, []
+        _check_parallel_holds_supported(self._backend)
+        leases = []
+        try:
+            for hold in originals:
+                leases.append(hold._reserve())
+        except BaseException:
+            for lease in leases:
+                lease.close()
+            raise
+        with getattr(self, "_lock", nullcontext()):
+            self._hold_leases.update(leases)
+        return new_args, new_kwargs, leases
+
+    def _release_all_hold_leases(self):
+        with getattr(self, "_lock", nullcontext()):
+            leases = list(self._hold_leases)
+            self._hold_leases.clear()
+        for lease in leases:
+            try:
+                lease.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     def _get_batch_size(self):
         """Returns the effective batch size for dispatch"""
@@ -1739,6 +1880,13 @@ class Parallel(Logger):
             self._running = False
             if not detach_generator_exit:
                 self._terminate_and_reset()
+            # Any lease still attached to a tracker that will never be
+            # retrieved (aborted batch, early generator close, worker crash)
+            # is released here.  Leases of normal batches have already been
+            # released when their outcome was registered.
+            for tracker in list(_remaining_outputs):
+                tracker.release_hold_leases()
+            self._release_all_hold_leases()
 
         while len(_remaining_outputs) > 0:
             batched_results = _remaining_outputs.popleft()
@@ -1911,7 +2059,14 @@ class Parallel(Logger):
             for func, args, kwargs in iterable:
                 self.n_dispatched_batches += 1
                 self.n_dispatched_tasks += 1
-                res = func(*args, **kwargs)
+                # Sequential execution still honours result holds: a lease is
+                # reserved before running the task and released as soon as it
+                # returns (or raises).
+                args, kwargs, leases = self._prepare_sequential_task(args, kwargs)
+                try:
+                    res = func(*args, **kwargs)
+                finally:
+                    self._release_hold_leases(leases)
                 self.n_completed_tasks += 1
                 self.print_progress()
                 yield res
@@ -1925,6 +2080,7 @@ class Parallel(Logger):
             self._running = False
             self._iterating = False
             self._original_iterator = None
+            self._release_all_hold_leases()
             self.print_progress()
 
     def _reset_run_tracking(self):

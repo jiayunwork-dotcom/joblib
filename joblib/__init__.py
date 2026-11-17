@@ -113,6 +113,13 @@ import os
 
 from ._cloudpickle_wrapper import wrap_non_picklable_objects
 from ._parallel_backends import ParallelBackendBase
+from ._result_holds import (
+    CacheInUseError,
+    HoldNotSupportedError,
+    ResultHold,
+    ResultReleasedError,
+    ResultUnavailableError,
+)
 from ._store_backends import StoreBackendBase
 from .compressor import register_compressor
 from .hashing import hash
@@ -134,6 +141,12 @@ __all__ = [
     "Memory",
     "MemorizedResult",
     "expires_after",
+    # Explicit protection of cached results
+    "ResultHold",
+    "CacheInUseError",
+    "HoldNotSupportedError",
+    "ResultReleasedError",
+    "ResultUnavailableError",
     # Parallel code execution
     "Parallel",
     "delayed",
