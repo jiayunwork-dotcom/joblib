@@ -284,6 +284,65 @@ maintenance can always reclaim unused values later. `get` on a closed
 hold raises `ResultReleasedError`, and a hold never returns a value
 recomputed at the same cache path after the pinned one was removed.
 
+Result generations
+~~~~~~~~~~~~~~~~~~
+
+A cache path (function identifier + arguments hash) can hold several
+*generations* over time: a forced `MemorizedFunc.call`, a recomputation
+after the function code changed, or a new computation after the value was
+deleted. A `MemorizedResult` returned by `call_and_shelve` refers to the
+generation it actually observed -- the one written by its own computation,
+or the one it found as a cache hit -- not to "whatever is stored at the
+path now". This is what makes the following behaviour hold:
+
+* If the referred generation is deleted and the function is recomputed with
+  the same arguments, `MemorizedResult.pin` raises `KeyError` (specifically
+  `ResultUnavailableError`). It does **not** silently adopt the new value,
+  even if that value is byte-for-byte identical.
+* If the generation is gone but the shelf was pickled and restored, or was
+  sent to another process, `pin` still refuses: identity travels with the
+  shelf.
+* If the referred generation is still protected by some other hold, it has
+  been moved to the *retired* area of the cache instead of deleted, and
+  pinning the old shelf again resolves that retired copy. Two generations
+  can therefore be read, and their tasks can interleave, at the same time.
+* Once the last holder of an old generation closes its handle, the next
+  maintenance call reclaims the retired copy. Retired copies are also
+  reclaimed when a new generation is published, so they never accumulate
+  with the history of recomputations.
+
+Each cached entry carries a small `generation` file next to `output.pkl`.
+It is constant size and rewritten in place on every publication; nothing
+is copied and no history of values is kept. `mmap_mode='r'` still maps the
+original array file directly.
+
+Compatibility boundary
+~~~~~~~~~~~~~~~~~~~~~~
+
+* A `MemorizedResult` unpickled from a file produced by joblib 1.5.2 or
+  older carries no generation information. `get`, `clear` and ordinary
+  cache hits keep working, but `pin` raises `KeyError`: it cannot prove
+  which value the shelf refers to and will not adopt the current file.
+  Recompute the shelf (or call `MemorizedFunc.call_and_shelve` again) to
+  obtain a pinnable reference.
+* Cache entries written by an older joblib have no generation marker.
+  They are still usable for hits. Pinning one *while it is unchanged*
+  seals that exact file (verified by the file's stat identity, atomically
+  with publication) and works; if it has been replaced in the meantime,
+  `pin` raises `KeyError` instead of adopting the replacement.
+* Third-party store backends that do not implement the generation hooks
+  keep working for `get`, `clear` and cache hits, but return shelves that
+  cannot be pinned; the failure is explicit rather than a silent loss of
+  protection.
+* Hold handles pickled by an intermediate version that recorded a stat
+  identity are treated as unknown-generation: using them to load a value
+  raises `ResultUnavailableError`.
+* The existing public signatures (`MemorizedResult.get`/`pin`/`clear`,
+  `MemorizedFunc.call_and_shelve`, `ResultHold.get`/`close`) and the
+  exception family (`KeyError`, `ResultUnavailableError`,
+  `ResultReleasedError`, `HoldNotSupportedError`, `CacheInUseError`) are
+  unchanged. `ResultUnavailableError` is a `KeyError` subclass.
+
 Holding across a `Parallel` call
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -604,6 +663,12 @@ without actually needing to call the function itself::
     :members: get, close
 
 .. autoexception:: CacheInUseError
+
+.. autoexception:: ResultUnavailableError
+
+.. autoexception:: ResultReleasedError
+
+.. autoexception:: HoldNotSupportedError
 
 
 ..

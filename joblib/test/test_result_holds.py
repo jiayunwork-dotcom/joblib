@@ -24,6 +24,7 @@ from joblib._result_holds import (
     ResultUnavailableError,
     holds_supported,
 )
+from joblib.memory import MemorizedResult
 from joblib.test.common import np, with_numpy
 from joblib.testing import raises
 
@@ -1073,3 +1074,512 @@ def test_hold_keeps_cached_function_and_memory_in_sync(tmp_path):
         assert len(calls) == 1
     finally:
         hold.close()
+
+
+###############################################################################
+# Generation identity of a shelf
+#
+# A shelf returned by ``call_and_shelve`` must keep referring to the
+# generation of the value it observed or published.  These tests use an
+# ``event``-driven interposition rather than sleeps: the replacement happens
+# exactly inside the handoff window, at a point chosen by the test.
+
+
+def _generation_file(result):
+    return os.path.join(item_path(result), "generation")
+
+
+def _drop_generation_markers(location):
+    """Turn entries into ones as written by a joblib without markers."""
+    for dirpath, _, filenames in os.walk(location):
+        if "generation" in filenames:
+            os.unlink(os.path.join(dirpath, "generation"))
+
+
+def _stateful_cache(memory, state):
+    calls = []
+
+    @memory.cache
+    def make(x):
+        calls.append(x)
+        return np.array([state["value"], x], dtype=np.int64)
+
+    return make, calls
+
+
+@with_numpy
+def test_shelf_pin_rejects_deleted_then_recomputed_result(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, calls = _stateful_cache(memory, state)
+
+    old = make.call_and_shelve(0)
+    np.testing.assert_array_equal(old.get(), [11, 0])
+    old.clear()
+    state["value"] = 22
+    new = make.call_and_shelve(0)
+    np.testing.assert_array_equal(new.get(), [22, 0])
+    assert len(calls) == 2
+
+    with raises(KeyError):
+        old.pin()
+    # The new shelf, by contrast, protects the new generation.
+    with new.pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [22, 0])
+
+
+@with_numpy
+def test_shelf_pin_rejects_same_value_recomputation(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, calls = _stateful_cache(memory, state)
+
+    old = make.call_and_shelve(0)
+    old.clear()
+    # The recomputation produces byte-for-byte the same array.
+    new = make.call_and_shelve(0)
+    assert len(calls) == 2
+    np.testing.assert_array_equal(old.get(), new.get())
+
+    with raises(KeyError):
+        old.pin()
+    with new.pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [11, 0])
+
+
+@with_numpy
+def test_shelf_pin_rejects_recompute_after_restoring_old_pickle(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+
+    old = make.call_and_shelve(0)
+    blob = pickle.dumps(old)
+    old.clear()
+    state["value"] = 22
+    make.call_and_shelve(0)
+
+    restored = pickle.loads(blob)
+    with raises(KeyError):
+        restored.pin()
+
+
+@with_numpy
+def test_old_shelf_pins_retired_generation_after_replacement(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, mmap_mode="r", verbose=0)
+    make, calls = _stateful_cache(memory, state)
+
+    old = make.call_and_shelve(0)
+    first = old.pin()
+    old_file = output_filename(old)
+    old_stat = os.stat(old_file)
+    try:
+        state["value"] = 22
+        make.call(0)  # force a recomputation at the same path
+        # Both handles read the full, correct old value.
+        np.testing.assert_array_equal(first.get(), [11, 0])
+        second = old.pin()  # re-pin the same old shelf: retired copy
+        np.testing.assert_array_equal(second.get(), [11, 0])
+        second.close()
+        # The old generation is a renamed file: same inode and size, and the
+        # canonical path now holds the new generation (different inode).
+        retired = os.path.join(holds_dir(memory), "retired")
+        retired_files = [
+            os.path.join(dirpath, "output.pkl")
+            for dirpath, _, names in os.walk(retired)
+            if "output.pkl" in names
+        ]
+        assert len(retired_files) == 1
+        retired_stat = os.stat(retired_files[0])
+        assert (retired_stat.st_ino, retired_stat.st_size) == (
+            old_stat.st_ino,
+            old_stat.st_size,
+        )
+        new_stat = os.stat(old_file)
+        assert new_stat.st_ino != old_stat.st_ino
+        assert new_stat.st_size == old_stat.st_size
+        # The new generation is readable at the same time, unaffected.
+        fresh = make.call_and_shelve(0)
+        np.testing.assert_array_equal(fresh.get(), [22, 0])
+        assert len(calls) == 2
+        # Clearing the old path is refused while the old generation is held.
+        with raises(CacheInUseError):
+            old.clear()
+    finally:
+        first.close()
+    # Once the last old holder exits, maintenance reclaims the retired copy
+    # and the canonical generation remains usable.
+    assert memory.reduce_size(items_limit=0) is True
+    assert memory.store_backend.get_items() == []
+    # The retired copy and the bookkeeping directory are gone.
+    retired = os.path.join(holds_dir(memory), "retired")
+    assert not os.path.exists(retired)
+
+
+@with_numpy
+def test_shelf_from_cache_hit_refers_to_observed_generation(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, calls = _stateful_cache(memory, state)
+    make(0)
+    assert len(calls) == 1
+
+    hit = make.call_and_shelve(0)
+    assert len(calls) == 1  # a hit, not a recomputation
+    state["value"] = 22
+    make.call(0)
+    assert len(calls) == 2
+    # The shelf observed 11; 22 is a different generation at the same path.
+    with raises(KeyError):
+        hit.pin()
+
+
+@with_numpy
+def test_generation_marker_is_replaced_not_accumulated(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    make.call_and_shelve(0)
+    result = make.call_and_shelve(0)
+    markers_before = os.listdir(item_path(result))
+    for value in range(12, 20):
+        state["value"] = value
+        make.call(0)
+    # A constant-size marker per cache entry: no history of past values.
+    item_dir = item_path(result)
+    assert os.path.exists(_generation_file(result))
+    assert sorted(os.listdir(item_dir)) == sorted(markers_before)
+    with make.call_and_shelve(0).pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [19, 0])
+
+
+@with_numpy
+def test_handoff_after_publication_replacement_is_rejected(tmp_path):
+    """Result written but shelf not returned yet: another writer replaces it."""
+    from joblib import memory as memory_module
+
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    original = memory_module.MemorizedFunc._get_memorized_result
+    fired = []
+
+    def racing(self, call_id, metadata=None, generation=None, generation_identity=None):
+        if not fired:
+            fired.append(True)
+            state["value"] = 22
+            self.call(0)  # replace before returning the shelf
+        return original(
+            self,
+            call_id,
+            metadata=metadata,
+            generation=generation,
+            generation_identity=generation_identity,
+        )
+
+    memory_module.MemorizedFunc._get_memorized_result = racing
+    try:
+        old = make.call_and_shelve(0)
+    finally:
+        memory_module.MemorizedFunc._get_memorized_result = original
+    assert fired
+    with raises(KeyError):
+        old.pin()
+
+
+@with_numpy
+def test_handoff_after_hit_replacement_is_rejected(tmp_path):
+    """Cache hit validated but shelf not returned: the hit is replaced."""
+    from joblib import memory as memory_module
+
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, calls = _stateful_cache(memory, state)
+    make(0)
+    original = memory_module.MemorizedFunc._get_memorized_result
+    fired = []
+
+    def racing(self, call_id, metadata=None, generation=None, generation_identity=None):
+        if not fired:
+            fired.append(True)
+            state["value"] = 22
+            self.call(0)
+        return original(
+            self,
+            call_id,
+            metadata=metadata,
+            generation=generation,
+            generation_identity=generation_identity,
+        )
+
+    memory_module.MemorizedFunc._get_memorized_result = racing
+    try:
+        hit = make.call_and_shelve(0)
+    finally:
+        memory_module.MemorizedFunc._get_memorized_result = original
+    assert fired
+    assert len(calls) == 2
+    with raises(KeyError):
+        hit.pin()
+
+
+@with_numpy
+def test_handoff_after_hit_replacement_keeps_held_generation(tmp_path):
+    """Same window, but the observed hit is held and therefore retired."""
+    from joblib import memory as memory_module
+
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    first = make.call_and_shelve(0)
+    keep = first.pin()
+    original = memory_module.MemorizedFunc._get_memorized_result
+    fired = []
+
+    def racing(self, call_id, metadata=None, generation=None, generation_identity=None):
+        if not fired:
+            fired.append(True)
+            state["value"] = 22
+            self.call(0)  # retires the observed generation
+        return original(
+            self,
+            call_id,
+            metadata=metadata,
+            generation=generation,
+            generation_identity=generation_identity,
+        )
+
+    memory_module.MemorizedFunc._get_memorized_result = racing
+    try:
+        hit = make.call_and_shelve(0)
+    finally:
+        memory_module.MemorizedFunc._get_memorized_result = original
+    assert fired
+    hold = hit.pin()
+    try:
+        np.testing.assert_array_equal(hold.get(), [11, 0])
+    finally:
+        hold.close()
+        keep.close()
+
+
+@with_numpy
+def test_unmarked_legacy_entry_is_pinned_only_if_unchanged(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, calls = _stateful_cache(memory, state)
+    make(0)
+    _drop_generation_markers(memory.store_backend.location)
+
+    # Plain reads and hits still work without generation information.
+    shelf = make.call_and_shelve(0)
+    assert len(calls) == 1
+    np.testing.assert_array_equal(shelf.get(), [11, 0])
+    # Pinning the unchanged file seals exactly that file.
+    with shelf.pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [11, 0])
+
+    # Replacing it makes the shelf refuse rather than adopt the new file.
+    state["value"] = 22
+    make.call(0)
+    with raises(KeyError):
+        shelf.pin()
+    with make.call_and_shelve(0).pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [22, 0])
+
+
+@with_numpy
+def test_legacy_shelf_pickle_without_generation_refuses_pin(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+
+    shelf = make.call_and_shelve(0)
+    state_dict = shelf.__getstate__()
+    state_dict.pop("_generation", None)
+    state_dict.pop("_generation_known", None)
+    state_dict.pop("_generation_identity", None)
+    legacy = MemorizedResult.__new__(MemorizedResult)
+    legacy.__setstate__(state_dict)
+
+    # Ordinary reads still work.
+    np.testing.assert_array_equal(legacy.get(), [11, 0])
+    # But the shelf cannot prove which generation it refers to.
+    with raises(KeyError):
+        legacy.pin()
+    # And the current file is not adopted even though it is the same one.
+    np.testing.assert_array_equal(shelf.pin().get(), [11, 0])
+
+
+@with_numpy
+def test_generation_is_stable_across_shelf_pickle(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+
+    shelf = make.call_and_shelve(0)
+    restored = pickle.loads(pickle.dumps(shelf))
+    assert restored.generation == shelf.generation
+    with restored.pin() as hold:
+        np.testing.assert_array_equal(hold.get(), [11, 0])
+    state["value"] = 22
+    make.call(0)
+    with raises(KeyError):
+        restored.pin()
+
+
+@with_numpy
+@pytest.mark.parametrize(
+    "backend,n_jobs",
+    [
+        ("sequential", 1),
+        ("threading", 2),
+        pytest.param(
+            "loky", 2, marks=pytest.mark.skipif(not HAVE_LOKY, reason="loky missing")
+        ),
+    ],
+)
+def test_two_generations_through_parallel_and_parent_closes(tmp_path, backend, n_jobs):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, mmap_mode="r", verbose=0)
+    make, calls = _stateful_cache(memory, state)
+
+    old = make.call_and_shelve(0)
+    hold_old = old.pin()
+    state["value"] = 22
+    make.call(0)
+    hold_new = make.call_and_shelve(0).pin()
+
+    generator = Parallel(
+        n_jobs=n_jobs,
+        backend=backend,
+        return_as="generator",
+        pre_dispatch="all",
+        batch_size=1,
+    )(delayed(_consume)(hold, 0) for _ in range(4) for hold in (hold_old, hold_new))
+    if backend != "sequential":
+        # Queued tasks own their protection; the parent may let go now.
+        hold_old.close()
+        hold_new.close()
+    outputs = list(generator)
+    if backend == "sequential":
+        hold_old.close()
+        hold_new.close()
+    assert outputs == [11.0, 22.0] * 4
+    assert len(calls) == 2
+    # Nothing was left protected after the run.
+    assert lease_files(memory) == []
+    assert memory.reduce_size(items_limit=0) is True
+
+
+@with_numpy
+def test_failure_in_one_generation_does_not_corrupt_the_other(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    hold_old = make.call_and_shelve(0).pin()
+    state["value"] = 22
+    make.call(0)
+    hold_new = make.call_and_shelve(0).pin()
+
+    def maybe_fail(hold, fail):
+        value = int(hold.get()[0])
+        if fail:
+            raise RuntimeError("boom")
+        return value
+
+    with pytest.raises(RuntimeError):
+        Parallel(n_jobs=2, backend="loky", batch_size=1)(
+            delayed(maybe_fail)(hold, fail)
+            for fail in (False, True, False, True)
+            for hold in (hold_old, hold_new)
+        )
+    try:
+        # Both parent handles still read their own generation.
+        np.testing.assert_array_equal(hold_old.get(), [11, 0])
+        np.testing.assert_array_equal(hold_new.get(), [22, 0])
+        # And the cache is usable for a new legal call after the failure.
+        assert memory.reduce_size(items_limit=0) is False
+    finally:
+        hold_old.close()
+        hold_new.close()
+    assert memory.reduce_size(items_limit=0) is True
+
+
+@with_numpy
+def test_generation_identity_survives_new_process(tmp_path):
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    store = str(tmp_path / "cache")
+    state = {"value": 11}
+    memory = Memory(location=store, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    old = make.call_and_shelve(0)
+    blob = str(tmp_path / "old.pkl")
+    with open(blob, "wb") as f:
+        pickle.dump(old, f)
+    old.clear()
+    state["value"] = 22
+    make.call_and_shelve(0)
+
+    child = textwrap.dedent(
+        """
+        import pickle, sys
+        sys.path.insert(0, sys.argv[1])
+        with open(sys.argv[2], "rb") as f:
+            shelf = pickle.load(f)
+        try:
+            shelf.pin()
+        except KeyError:
+            print("rejected")
+        else:
+            print("adopted")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", child, os.fspath(project_root), blob],
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout.decode().strip() == "rejected"
+
+
+@with_numpy
+def test_creating_or_pickling_a_shelf_does_not_create_a_hold(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+
+    shelf = make.call_and_shelve(0)
+    restored = pickle.loads(pickle.dumps(shelf))
+    assert lease_files(memory) == []
+    # An unheld shelf does not prevent maintenance.
+    assert memory.reduce_size(items_limit=0) is True
+    assert memory.store_backend.get_items() == []
+    assert lease_files(memory) == []
+    # And a shelf whose value is gone cannot be pinned, while get keeps the
+    # usual KeyError behaviour.
+    for candidate in (shelf, restored):
+        with raises(KeyError):
+            candidate.get()
+        with raises(KeyError):
+            candidate.pin()
+
+
+@with_numpy
+def test_directly_constructed_shelf_does_not_pin_current_file(tmp_path):
+    state = {"value": 11}
+    memory = Memory(location=tmp_path, verbose=0)
+    make, _ = _stateful_cache(memory, state)
+    make(0)
+    original = make.call_and_shelve(0)
+    # Rebuild the same reference the way the documentation allows for
+    # copy-pasting repr(), but without generation information.
+    rebuilt = MemorizedResult(original.store_backend, original._call_id, verbose=0)
+    # It can read the current file...
+    assert rebuilt.get()[0] == 11
+    # ...but it must not claim that file for a hold.
+    with raises(KeyError):
+        rebuilt.pin()
+    assert lease_files(memory) == []

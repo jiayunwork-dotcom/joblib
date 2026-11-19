@@ -15,6 +15,16 @@ Memory:
   requested limits were reached.  Hold handles can be passed to
   ``Parallel`` tasks (``n_jobs=1``, ``threading`` and ``loky``) and keep the
   result protected until the task completes, including failure paths.
+- A shelf returned by ``MemorizedFunc.call_and_shelve`` now refers to the
+  result *generation* it actually published or observed as a cache hit.
+  ``MemorizedResult.pin`` protects that exact generation: it raises ``KeyError``
+  if it has been deleted and recomputed (even with identical content), and
+  resolves the retired copy if the generation is still held elsewhere.
+  Each cached entry carries a small ``generation`` marker; it is constant
+  size, rewritten in place, and retired copies are reclaimed once their last
+  holder exits.  Shelves pickled by older joblib versions keep working for
+  ``get``/``clear`` but refuse to be pinned, instead of adopting a newer value
+  stored at the same path.
 
 Release 1.5.2 - 2025/08/27
 --------------------------

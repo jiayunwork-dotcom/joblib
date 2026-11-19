@@ -170,7 +170,7 @@ class StoreBackendMixin(object):
 
     # -- holds ---------------------------------------------------------
     def _holds_scope(self, scope_rel=None):
-        """Return ``(rel_path, identity)`` pairs held inside ``scope_rel``."""
+        """Return ``(rel_path, generation)`` pairs held inside ``scope_rel``."""
         if not self.supports_holds or self.location is None:
             return set()
         active = set(_result_holds.protected_items(self.location))
@@ -272,7 +272,15 @@ class StoreBackendMixin(object):
         return item
 
     def dump_item(self, call_id, item, verbose=1):
-        """Dump an item in the store at the id given as a list of str."""
+        """Dump an item in the store at the id given as a list of str.
+
+        Returns the opaque generation token of the value that was published,
+        or ``None`` when the backend cannot provide one (no hold support, or
+        the write failed).  ``call_and_shelve`` passes that token to the
+        shelf so that a later ``pin`` resolves *this* publication and never
+        a newer value written at the same path.
+        """
+        generation = None
         try:
             item_path = os.path.join(self.location, *call_id)
             if not self._item_exists(item_path):
@@ -302,7 +310,7 @@ class StoreBackendMixin(object):
             temporary_filename = concurrency_safe_write(item, filename, write_func)
             if not self.supports_holds:
                 self._move_item(temporary_filename, filename)
-                return
+                return None
             with _result_holds.store_lock(self.location, exclusive=True):
                 retired_dir = self._retire_held_locked(item_path, call_id)
                 if retired_dir is not None:
@@ -312,25 +320,53 @@ class StoreBackendMixin(object):
                         retired_dir, os.path.basename(temporary_filename)
                     )
                     self.create_location(item_path)
+                # Drop the previous marker before the value changes, so that
+                # a crash in the middle can only leave an *unmarked* item
+                # (which ``pin`` rejects) and never an old token attached to
+                # a new value.
+                token = _result_holds.prepare_generation(item_path)
+                if token is None:
+                    self.create_location(item_path)
+                    token = _result_holds.new_generation_token()
                 self._move_item(temporary_filename, filename)
+                _result_holds.publish_generation(item_path, token)
+                generation = token
         except Exception as e:  # noqa: E722
             warnings.warn(
                 "Unable to cache to disk. Possibly a race condition in the "
                 f"creation of the directory. Exception: {e}.",
                 CacheWarning,
             )
+        return generation
 
     def _retire_held_locked(self, item_path, call_id):
         """Retire the canonical value if it is held; return the new directory."""
         rel_path = _result_holds.relative_item_path(call_id)
-        active = _result_holds.protected_items(self.location)
-        identities = {identity for rel, identity in active if rel == rel_path}
-        if not identities:
+        generations = {
+            generation
+            for rel, generation in _result_holds.protected_items(self.location)
+            if rel == rel_path
+        }
+        if not generations:
             return None
-        current = _result_holds.identity_of_item(item_path)
-        if current in identities:
+        current = _result_holds.read_generation(item_path)
+        # A ``None`` generation comes from a lease written by an older
+        # version: it cannot name the value, so keep the whole path safe by
+        # retiring whatever is currently installed.
+        if None in generations or current in generations:
             return _result_holds.retire_item(self.location, rel_path, current)
         return None
+
+    def _retire_held_item_locked(self, item_path, rel_path, active):
+        """Retire ``item_path`` when the generation currently there is held."""
+        generations = {generation for rel, generation in active if rel == rel_path}
+        if not generations:
+            return False
+        current = _result_holds.read_generation(item_path)
+        if None in generations or current in generations:
+            _result_holds.retire_item(self.location, rel_path, current)
+            return True
+        return False
 
     def _invalidate_item_locked(self, call_id):
         """Remove an item; a held item is retired instead of deleted."""
@@ -339,11 +375,66 @@ class StoreBackendMixin(object):
             return
         rel_path = _result_holds.relative_item_path(call_id)
         active = _result_holds.protected_items(self.location)
-        current = _result_holds.identity_of_item(item_path)
-        if any(rel == rel_path and identity == current for rel, identity in active):
-            _result_holds.retire_item(self.location, rel_path, current)
-        else:
+        if not self._retire_held_item_locked(item_path, rel_path, active):
             self.clear_location(item_path)
+
+    def capture_item(self, call_id):
+        """Return ``(exists, generation, identity)`` for a cache item.
+
+        The existence check, the generation read and the stat identity are
+        performed under the store shared lock (when holds are supported),
+        which is atomic with respect to publication.  This is what lets a
+        cache hit record the generation it actually observed even if the path
+        is replaced before the shelf is returned.
+
+        ``identity`` is only used as a conservative fallback for entries
+        written by an older joblib that carry no generation marker; see
+        :meth:`_seal_item_locked`.
+        """
+        item_path = os.path.join(self.location, *call_id)
+        filename = os.path.join(item_path, "output.pkl")
+        if not self.supports_holds:
+            exists = self._item_exists(filename)
+            if not exists:
+                return False, None, None
+            return (
+                True,
+                _result_holds.read_generation(item_path),
+                _result_holds.result_identity(filename),
+            )
+        with _result_holds.store_lock(self.location, exclusive=False):
+            exists = self._item_exists(filename)
+            if not exists:
+                return False, None, None
+            return (
+                True,
+                _result_holds.read_generation(item_path),
+                _result_holds.result_identity(filename),
+            )
+
+    def _seal_item_locked(self, call_id, identity):
+        """Bind a fresh token to an unmarked, unchanged item.
+
+        The caller must hold the store exclusive lock.  The item is sealed
+        only if it is still the very same file (same stat identity) and still
+        has no marker; otherwise ``None`` is returned and the caller must
+        refuse to pin rather than adopt whatever is now stored at the path.
+        """
+        item_path = os.path.join(self.location, *call_id)
+        filename = os.path.join(item_path, "output.pkl")
+        if _result_holds.result_identity(filename) != identity:
+            # The value changed since it was observed: this shelf must not
+            # adopt it.
+            return None
+        # The stat identity is unchanged, so an existing marker belongs to
+        # the same file: sealing is idempotent, which lets several pinners of
+        # one unmarked shelf agree on the same token.
+        existing = _result_holds.read_generation(item_path)
+        if existing is not None:
+            return existing
+        token = _result_holds.new_generation_token()
+        _result_holds.publish_generation(item_path, token)
+        return token
 
     def clear_item(self, call_id):
         """Clear the item at the id, given as a list of str."""

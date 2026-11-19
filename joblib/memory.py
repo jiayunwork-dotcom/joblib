@@ -29,6 +29,7 @@ from ._result_holds import (
     CacheInUseError,  # noqa: F401
     HoldNotSupportedError,
     ResultHold,
+    ResultUnavailableError,
 )
 from ._store_backends import (
     CacheWarning,  # noqa
@@ -209,6 +210,9 @@ class MemorizedResult(Logger):
         verbose=0,
         timestamp=None,
         metadata=None,
+        generation=None,
+        generation_known=True,
+        generation_identity=None,
     ):
         Logger.__init__(self)
         self._call_id = call_id
@@ -223,6 +227,30 @@ class MemorizedResult(Logger):
         self.duration = self.metadata.get("duration", None)
         self.verbose = verbose
         self.timestamp = timestamp
+        # Generation the shelf refers to.  ``None`` together with
+        # ``generation_known=False`` means "this shelf predates generation
+        # bookkeeping" (e.g. unpickled from an old file): ``get`` keeps
+        # working, ``pin`` refuses.
+        self._generation = generation
+        self._generation_known = generation_known
+        # Stat identity of an unmarked entry observed by a cache hit.  It is
+        # used once, by ``pin``, to conservatively seal that exact file with a
+        # generation token before protecting it.
+        self._generation_identity = generation_identity
+
+    @property
+    def generation(self):
+        """Opaque token of the result generation this shelf refers to.
+
+        ``None`` when the shelf carries no generation information; see
+        :meth:`pin`.
+        """
+        return self._generation
+
+    @property
+    def has_generation(self):
+        """Whether this shelf identifies a specific result generation."""
+        return self._generation_known and self._generation is not None
 
     @property
     def func(self):
@@ -263,38 +291,89 @@ class MemorizedResult(Logger):
         maintenance and cache invalidation cannot remove the underlying
         cached result.
 
-        ``pin()`` is atomic with respect to cache maintenance: it either
-        protects the exact value present when it was called, or raises
-        ``KeyError`` if that value was already removed.  A later computation
-        at the same cache path does not take over the protection.
+        The hold keeps the *generation* of the value that this
+        ``MemorizedResult`` refers to -- the one observed by the cache hit or
+        published by the computation that created the shelf -- and never a
+        later value computed at the same cache path.  ``pin()`` is atomic
+        with respect to cache maintenance and publication: it either protects
+        that exact generation (from the canonical path or from a retired copy
+        kept for other holders), or raises ``KeyError`` if it is gone.
+
+        A shelf that carries no generation information -- a shelf unpickled
+        from a file written by an older joblib version, or one created
+        without going through :meth:`MemorizedFunc.call_and_shelve` -- cannot
+        prove which value it refers to.  ``pin()`` rejects it with
+        ``KeyError`` rather than adopting whatever currently sits at the
+        cache path.  ``get`` and ``clear`` keep working on such a shelf.
 
         Returns
         -------
         hold: ResultHold
             Handle on the cached value.  ``get()`` honours the result's
             ``mmap_mode``.
+
+        Raises
+        ------
+        KeyError
+            If the generation this shelf refers to no longer exists, or if
+            the shelf carries no generation information.
         """
         _result_holds.require_holds("MemorizedResult.pin()")
         if not getattr(self.store_backend, "supports_holds", False):
             raise HoldNotSupportedError(
                 "The store backend of this result does not support holds."
             )
-        rel_path = _result_holds.relative_item_path(self._call_id)
-        with _result_holds.store_lock(self.store_backend.location, exclusive=False):
-            item_path = os.path.join(self.store_backend.location, rel_path)
-            identity = _result_holds.identity_of_item(item_path)
-            if identity is None:
-                raise KeyError(
-                    "Cannot pin a MemorizedResult whose value is not present "
-                    f"in the cache: {item_path}"
-                )
-            lease = _result_holds.create_lease(
-                self.store_backend.location, rel_path, identity
+        if not self.has_generation and self._generation_identity is None:
+            item_path = os.path.join(self.store_backend.location, *self._call_id)
+            raise KeyError(
+                "Cannot pin this MemorizedResult: it does not identify which "
+                "result generation it refers to (for instance it was "
+                "unpickled from an older version, or created without "
+                "MemorizedFunc.call_and_shelve). Refusing to adopt the value "
+                f"currently stored at {item_path}."
             )
+        rel_path = _result_holds.relative_item_path(self._call_id)
+        location = self.store_backend.location
+        if self.has_generation:
+            generation = self._generation
+            with _result_holds.store_lock(location, exclusive=False):
+                item_dir = _result_holds.resolve_generation(
+                    location, rel_path, generation
+                )
+                if item_dir is None:
+                    raise ResultUnavailableError(
+                        "Cannot pin a MemorizedResult whose result generation "
+                        "is no longer available: "
+                        f"{os.path.join(location, rel_path)}. It has been "
+                        "deleted or replaced by a different computation."
+                    )
+                lease = _result_holds.create_lease(location, rel_path, generation)
+        else:
+            # An unmarked entry observed by a cache hit before this version
+            # started writing markers.  Seal that exact file (same stat
+            # identity, still unmarked) and take the lease under one
+            # exclusive lock, so "observe then protect" stays atomic with
+            # publication.
+            generation = None
+            with _result_holds.store_lock(location, exclusive=True):
+                seal = getattr(self.store_backend, "_seal_item_locked", None)
+                if seal is not None:
+                    generation = seal(self._call_id, self._generation_identity)
+                if generation is None:
+                    raise ResultUnavailableError(
+                        "Cannot pin this MemorizedResult: the cached value it "
+                        "observed has been replaced by a different computation."
+                    )
+                lease = _result_holds.create_lease(location, rel_path, generation)
+            # Remember the sealed generation so that pinning the same shelf
+            # again resolves it directly instead of re-sealing.
+            self._generation = generation
+            self._generation_known = True
+            self._generation_identity = None
         return ResultHold(
             self.store_backend,
             rel_path,
-            identity,
+            generation,
             mmap_mode=self.mmap_mode,
             verbose=self.verbose,
             timestamp=self.timestamp,
@@ -314,7 +393,22 @@ class MemorizedResult(Logger):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["timestamp"] = None
+        # A stat identity is meaningful only in the process that observed
+        # it; never let a pickled shelf use it to seal some other file.
+        state["_generation_identity"] = None
         return state
+
+    def __setstate__(self, state):
+        # Shelves unpickled from joblib <= 1.5.2 carry no generation
+        # information: mark them as such instead of silently adopting the
+        # current file when they are pinned.
+        self.__dict__.update(state)
+        if "_generation" not in state:
+            self._generation = None
+        if "_generation_known" not in state:
+            self._generation_known = False
+        if "_generation_identity" not in state:
+            self._generation_identity = None
 
 
 class NotMemorizedResult(object):
@@ -525,13 +619,32 @@ class MemorizedFunc(Logger):
         Returns True if the function call is in cache and can be used, and
         returns False otherwise.
         """
-        # Check if the code of the function has changed
-        if not self._check_previous_func_code(stacklevel=4):
-            return False
+        return self._cache_lookup(call_id)[0]
 
-        # Check if this specific call is in the cache
-        if not self.store_backend.contains_item(call_id):
-            return False
+    def _cache_lookup(self, call_id):
+        """Return ``(is_valid_hit, generation, identity)`` for ``call_id``.
+
+        ``generation`` is the token of the item that was validated as a hit,
+        captured atomically with the existence check so that it identifies
+        the value actually observed, even if the path is replaced before the
+        caller builds a shelf.  It is ``None`` on a miss and for an entry
+        written before generation markers existed; ``identity`` then
+        describes the observed file and may be used to seal it.  Third-party
+        backends that predate this bookkeeping provide neither.
+        """
+        # Check if the code of the function has changed
+        if not self._check_previous_func_code(stacklevel=5):
+            return False, None, None
+
+        capture = getattr(self.store_backend, "capture_item", None)
+        if capture is None:
+            if not self.store_backend.contains_item(call_id):
+                return False, None, None
+            generation, identity = None, None
+        else:
+            exists, generation, identity = capture(call_id)
+            if not exists:
+                return False, None, None
 
         # Call the user defined cache validation callback
         metadata = self.store_backend.get_metadata(call_id)
@@ -542,9 +655,9 @@ class MemorizedFunc(Logger):
             # The value is declared invalid: it must not be returned as a hit
             # anymore, but an actively held copy must remain readable.
             self.store_backend.invalidate_item(call_id)
-            return False
+            return False, None, None
 
-        return True
+        return True, generation, identity
 
     def _cached_call(self, args, kwargs, shelving):
         """Call wrapped function and cache result, or read cache if available.
@@ -592,10 +705,19 @@ class MemorizedFunc(Logger):
 
         # Compare the function code with the previous to see if the
         # function code has changed and check if the results are present in
-        # the cache.
-        if self._is_in_cache_and_valid(call_id):
+        # the cache.  ``generation`` identifies the value that was actually
+        # observed as a hit, captured together with the existence check.
+        hit, generation, identity = self._cache_lookup(call_id)
+        if hit:
             if shelving:
-                return self._get_memorized_result(call_id), {}
+                return (
+                    self._get_memorized_result(
+                        call_id,
+                        generation=generation,
+                        generation_identity=identity,
+                    ),
+                    {},
+                )
 
             try:
                 start_time = time.time()
@@ -919,13 +1041,18 @@ class MemorizedFunc(Logger):
             print(format_call(self.func, args, kwargs))
 
     def _after_call(self, call_id, args, kwargs, shelving, output, start_time):
-        self.store_backend.dump_item(call_id, output, verbose=self._verbose)
+        generation = self.store_backend.dump_item(
+            call_id, output, verbose=self._verbose
+        )
         duration = time.time() - start_time
         if self._verbose > 0:
             self._print_duration(duration)
         metadata = self._persist_input(duration, call_id, args, kwargs)
         if shelving:
-            return self._get_memorized_result(call_id, metadata), metadata
+            return (
+                self._get_memorized_result(call_id, metadata, generation=generation),
+                metadata,
+            )
 
         if self.mmap_mode is not None:
             # Memmap the output at the first call to be consistent with
@@ -983,7 +1110,13 @@ class MemorizedFunc(Logger):
             )
         return metadata
 
-    def _get_memorized_result(self, call_id, metadata=None):
+    def _get_memorized_result(
+        self, call_id, metadata=None, generation=None, generation_identity=None
+    ):
+        # ``generation=None`` means the entry carries no marker (for instance
+        # it was written by an older joblib).  The shelf remembers the stat
+        # identity it observed so that ``pin`` can seal exactly that file or
+        # refuse; it never pretends to know the current generation.
         return MemorizedResult(
             self.store_backend,
             call_id,
@@ -991,6 +1124,9 @@ class MemorizedFunc(Logger):
             metadata=metadata,
             timestamp=self.timestamp,
             verbose=self._verbose - 1,
+            generation=generation,
+            generation_known=generation is not None,
+            generation_identity=generation_identity,
         )
 
     def _load_item(self, call_id, metadata=None):

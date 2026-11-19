@@ -23,41 +23,80 @@ when the owning process is killed, so a crash can never leave a permanent
 hold.  No timestamp, heartbeat or background daemon is involved: an active
 hold is only released when its last holder closes it.
 
-A cached value is identified by the ``(st_dev, st_ino, st_mtime_ns,
-st_size)`` tuple of its ``output.pkl`` file.  Cache writes are atomic
-renames, therefore recomputing a result at the same path changes its
-identity.  When a held entry has to be replaced (function code change,
-validation callback, forced ``call``) it is moved -- renamed, not copied --
-to ``<store>.joblib_holds/retired`` so old holders keep reading the old
-value while the canonical path receives the new result.
+Result generations
+------------------
+A cache path (``func_id/args_id``) can host several *generations* over time:
+the first computation, a forced ``call``, a recomputation after the function
+code changed, etc.  A shelf returned by ``call_and_shelve`` must keep
+referring to the generation it actually observed or published -- never to a
+later one that happens to live at the same path.
+
+Every publication therefore writes a fresh random *generation token* in a
+tiny ``generation`` file inside the item directory, under the store
+exclusive lock and in a fail-closed order: the previous token is removed
+first, then ``output.pkl`` is atomically replaced, then the new token is
+installed with an atomic rename.  A crash in the middle leaves an unmarked
+value, for which ``pin`` refuses explicitly instead of guessing.  The token
+travels with the directory when it is retired, is replaced in place on every
+recomputation (so it does not accumulate), and is small and constant size.
+
+``MemorizedResult`` stores the token captured at publish time (miss) or at
+the moment the cache hit was validated.  ``pin`` resolves ``(rel_path,
+token)`` to the canonical directory or to a retired copy; if that exact
+generation is gone it raises :class:`ResultUnavailableError` (a ``KeyError``
+subclass).  If a shelf predates this bookkeeping (old pickle, or an entry
+written without a token), ``pin`` refuses rather than adopting the current
+file.  ``get`` and ``clear`` on such a shelf keep their historical
+behaviour.
+
+The generation token is what leases record, so maintenance, retirement and
+cleanup are all expressed in terms of "which generation is held", and two
+generations can be read and maintained concurrently.
+
+Replacing a held entry (function code change, validation callback, forced
+``call``) moves -- renames, not copies -- its directory to
+``<store>.joblib_holds/retired`` so old holders keep reading the old value
+while the canonical path receives the new result.  Retired copies are
+reclaimed once no live lease refers to their generation.
 
 The first version supports POSIX local filesystems only.  ``require_holds``
 raises :class:`HoldNotSupportedError` when ``flock`` is unavailable so that an
 unsupported platform fails loudly instead of silently dropping protection.
 
-Alternative organization considered
------------------------------------
-Two designs were evaluated:
+Alternative organizations considered
+------------------------------------
+Three designs were evaluated for the generation identity:
 
-1. **Reference-counted marker files (implemented here).**  Each hold is a
-   lease file locked with ``flock``.  *Crash reclamation:* free (no
-   ``flock``) files are reclaimed by the next maintenance call, at no cost
-   when nothing is held.  *Concurrency:* a store-wide shared/exclusive lock
-   makes "check existence then lease" atomic against deletion.
-   *File overhead:* one empty file per hold, no file at all for an unpinned
-   cache.
-2. **Per-item counters inside the cache directory.**  A small JSON/text
-   counter next to ``output.pkl`` would avoid a global lock, but increments
-   are not atomic across processes without an extra lock; a crash between
-   "increment" and "decrement" would leak a permanent reference, requiring
-   either timestamps/heartbeats (violates "no timeout revocation") or a
-   process-liveness scan.  It also writes inside every held item, and a
-   reader must rewrite it to decrement, which is fragile on read-only
-   mounts.
+1. **Stat identity of ``output.pkl`` (the previous behaviour).**  The
+   ``(st_dev, st_ino, st_mtime_ns, st_size)`` tuple changes on the atomic
+   rename that publishes a value, so it can distinguish generations without
+   extra files.  *Cost:* no extra I/O.  *Weakness:* it is only an identity
+   of a file *currently on disk*; a shelf that is read from a pickle or a
+   new process has no record of it, and after a delete + recreate the tuple
+   can in principle be reused (inode recycling with equal size and coarse
+   timestamps).  More importantly it does not survive retirement lookups by
+   a shelf that never captured it, which is exactly the reported bug.
+2. **Per-item reference counters beside ``output.pkl``.**  A counter would
+   remove the global lock, but increments and decrements are not atomic
+   across processes without a lock, a crash between them leaks a permanent
+   reference, and a reader must rewrite the item to decrement it, which
+   breaks on read-only mounts.
+3. **Random generation token stored in the item directory (implemented).**
+   One 32-byte file per cache entry, rewritten in place on every publish and
+   moved with the directory on retirement.  It is copied through the shelf
+   pickle and survives processes; resolution is two small reads (canonical,
+   then retired scan) under the existing short shared lock.  *Cost:* one
+   extra tiny file per cached entry and two extra renames per publication.
+   *Failure mode:* a crash between value and token publication leaves an
+   unmarked value, and ``pin`` fails explicitly -- never adopts it.
 
-The lease design was chosen: crashes are handled by the kernel releasing
-``flock`` (no timeout, no daemon), and the bookkeeping grows with the number
-of live holds, never with array size.
+The token design was chosen: it is durable across processes, robust to
+inode reuse, contains bookkeeping per cache entry and per live generation
+only, and composes with the lease protocol without lengthening its locks.
+
+The lease design was chosen over counters: crashes are handled by the kernel
+releasing ``flock`` (no timeout, no daemon), and the bookkeeping grows with
+the number of live holds, never with array size.
 """
 
 import hashlib
@@ -77,6 +116,7 @@ HOLDS_SUFFIX = ".joblib_holds"
 LEASES_DIRNAME = "leases"
 RETIRED_DIRNAME = "retired"
 OUTPUT_FILENAME = "output.pkl"
+GENERATION_FILENAME = "generation"
 
 
 class HoldNotSupportedError(NotImplementedError):
@@ -160,7 +200,12 @@ def is_in_scope(rel_path, scope_rel):
 
 
 def result_identity(output_path):
-    """Return the identity of a cached value, or ``None`` if it is missing."""
+    """Return a stat identity for a file, or ``None`` if it is missing.
+
+    Kept for backwards compatibility and for callers that need a cheap
+    "did this file change" probe.  Result *generations* are identified by
+    :func:`generation_of_item`, not by this tuple.
+    """
     try:
         stat = os.stat(output_path)
     except OSError:
@@ -169,7 +214,153 @@ def result_identity(output_path):
 
 
 def identity_of_item(item_path):
+    """Return the stat identity of an item's value, for diagnostics only."""
     return result_identity(os.path.join(item_path, OUTPUT_FILENAME))
+
+
+def _generation_path(item_path):
+    return os.path.join(item_path, GENERATION_FILENAME)
+
+
+def new_generation_token():
+    """Return a fresh, opaque, constant-size generation token."""
+    return uuid.uuid4().hex
+
+
+def _file_identity(output_path):
+    """Return ``(st_dev, st_ino)`` of a file, or ``None`` if it is missing.
+
+    Unlike :func:`result_identity` this ignores mtime and size, so it stays
+    valid when a memmap opened with ``r+`` writes into the file, and it
+    survives the directory rename that retires an item.
+    """
+    try:
+        stat = os.stat(output_path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def read_generation(item_path):
+    """Return the generation token of a cache item, or ``None``.
+
+    ``None`` means "this item carries no usable generation information": an
+    entry written by an older joblib, a partial publication, a marker that
+    does not match the file now in place, or a directory populated
+    externally.  Callers must treat it as unknown -- never as "the current
+    generation".
+
+    The marker records the ``(st_dev, st_ino)`` of the value it was
+    published with.  An out-of-band overwrite of ``output.pkl`` changes the
+    inode (publication is an atomic rename) and therefore invalidates the
+    marker, so a shelf can never be pointed at a value it did not observe.
+    """
+    try:
+        with open(_generation_path(item_path), "rb") as f:
+            raw = f.read(128)
+    except OSError:
+        return None
+    parts = raw.strip().decode("ascii", "replace").split()
+    if not parts or len(parts) > 3:
+        return None
+    token = parts[0] or None
+    if token is None:
+        return None
+    if len(parts) == 3:
+        try:
+            recorded = (int(parts[1]), int(parts[2]))
+        except ValueError:
+            return None
+        if _file_identity(os.path.join(item_path, OUTPUT_FILENAME)) != recorded:
+            return None
+    return token
+
+
+def generation_of_item(item_path):
+    """Return the generation token of an existing, complete item, or ``None``."""
+    if identity_of_item(item_path) is None:
+        return None
+    return read_generation(item_path)
+
+
+def _write_generation(item_path, token):
+    """Install ``token`` for ``item_path`` with an atomic rename."""
+    identity = _file_identity(os.path.join(item_path, OUTPUT_FILENAME))
+    payload = token.encode("ascii")
+    if identity is not None:
+        payload += f" {identity[0]} {identity[1]}".encode("ascii")
+    destination = _generation_path(item_path)
+    temporary = destination + f".{uuid.uuid4().hex}-{os.getpid()}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def prepare_generation(item_path):
+    """Start a new generation for ``item_path`` and return its token.
+
+    The previous marker is removed *first* so that a crash before the new
+    value is published leaves an item that ``pin`` rejects, rather than an
+    old token attached to a new value.  Must be called while holding the
+    store exclusive lock.
+
+    Returns ``None`` if the item directory does not exist: the caller must
+    create it and call :func:`publish_generation` afterwards.
+    """
+    if not os.path.isdir(item_path):
+        return None
+    try:
+        os.unlink(_generation_path(item_path))
+    except OSError:
+        pass
+    return new_generation_token()
+
+
+def publish_generation(item_path, token):
+    """Install ``token`` as the generation of a fully written item."""
+    _write_generation(item_path, token)
+
+
+def resolve_generation(store_location, rel_path, token):
+    """Locate the directory holding generation ``token`` of ``rel_path``.
+
+    The canonical cache path wins when it still carries that exact token.
+    Otherwise a retired copy with the same token is looked up, which is what
+    makes a hold survive invalidation at the same path.  Returns ``None``
+    when the generation is gone.
+    """
+    if token is None:
+        return None
+    canonical = os.path.join(store_location, rel_path)
+    if identity_of_item(canonical) is None:
+        canonical = None
+    if canonical is not None and read_generation(canonical) == token:
+        return canonical
+
+    retired = _retired_dir(store_location)
+    prefix = item_key(rel_path) + "."
+    try:
+        names = os.listdir(retired)
+    except OSError:
+        return None
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        candidate = os.path.join(retired, name)
+        if read_generation(candidate) == token:
+            return candidate
+    return None
 
 
 class _StoreLock:
@@ -207,14 +398,24 @@ def store_lock(store_location, exclusive):
 
 
 def _read_lease_metadata(path):
+    """Return ``(rel_path, generation)`` for a lease file, or ``None``.
+
+    Older lease files recorded a stat identity under ``identity``.  Those
+    leases predate generation bookkeeping and are reported with a ``None``
+    generation; maintenance still respects them, but they never match a
+    token-based lookup.
+    """
     try:
         with open(path, "rb") as f:
             raw = f.read()
         if not raw:
             return None
         data = json.loads(raw.decode("utf-8"))
-        return (data["rel"], tuple(data["identity"]))
-    except (OSError, ValueError, KeyError, TypeError):
+        generation = data.get("generation")
+        if generation is not None:
+            generation = str(generation)
+        return (data["rel"], generation)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
@@ -225,17 +426,22 @@ class Lease:
     its lease file.  :meth:`close` is idempotent.
     """
 
-    def __init__(self, fd, path, rel_path, identity, unlink_on_close=True):
+    def __init__(self, fd, path, rel_path, generation, unlink_on_close=True):
         self._fd = fd
         self._path = path
         self.rel_path = rel_path
-        self.identity = identity
+        self.generation = generation
         self._unlink_on_close = unlink_on_close
         self._close_lock = threading.Lock()
 
     @property
     def path(self):
         return self._path
+
+    @property
+    def identity(self):
+        """Backwards-compatible alias for the generation token."""
+        return self.generation
 
     @property
     def closed(self):
@@ -268,8 +474,8 @@ class Lease:
             pass
 
 
-def create_lease(store_location, rel_path, identity):
-    """Create a new, already locked lease for ``rel_path``/``identity``.
+def create_lease(store_location, rel_path, generation):
+    """Create a new, already locked lease for ``rel_path``/``generation``.
 
     The caller must hold the store shared lock so that a concurrent
     maintenance cannot miss the newly created lease.
@@ -283,7 +489,7 @@ def create_lease(store_location, rel_path, identity):
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        payload = json.dumps({"rel": rel_path, "identity": list(identity)})
+        payload = json.dumps({"rel": rel_path, "generation": generation})
         os.write(fd, payload.encode("utf-8"))
     except BaseException:
         try:
@@ -294,7 +500,7 @@ def create_lease(store_location, rel_path, identity):
             except OSError:  # pragma: no cover - defensive
                 pass
         raise
-    return Lease(fd, path, rel_path, identity)
+    return Lease(fd, path, rel_path, generation)
 
 
 def _try_open_lease_for_scan(path):
@@ -306,7 +512,7 @@ def _try_open_lease_for_scan(path):
 
 
 def scan_leases(store_location, clean_stale=True):
-    """Return ``(rel_path, identity)`` pairs for active leases.
+    """Return ``(rel_path, generation)`` pairs for active leases.
 
     A lease whose file is not locked anymore belongs to a process that
     exited or crashed; it is removed when ``clean_stale`` is true.  Callers
@@ -346,47 +552,29 @@ def scan_leases(store_location, clean_stale=True):
 
 
 def protected_items(store_location):
-    """Return the ``(rel_path, identity)`` pairs currently held.
+    """Return the ``(rel_path, generation)`` pairs currently held.
 
-    Must be called while holding the store exclusive lock.
+    A ``None`` generation means an old lease file that predates generation
+    bookkeeping.  Must be called while holding the store exclusive lock.
     """
     return set(scan_leases(store_location))
 
 
-def resolve_item_dir(store_location, rel_path, identity):
-    """Locate the on-disk directory holding the value ``identity``.
-
-    The canonical cache path wins when it still contains that exact value.
-    Otherwise a retired copy with the same identity is looked up, which is
-    what makes a hold survive cache invalidation at the same path.
-    """
-    canonical = os.path.join(store_location, rel_path)
-    if identity_of_item(canonical) == identity:
-        return canonical
-
-    retired = _retired_dir(store_location)
-    prefix = item_key(rel_path) + "."
-    try:
-        names = os.listdir(retired)
-    except OSError:
-        return None
-    for name in names:
-        if not name.startswith(prefix):
-            continue
-        candidate = os.path.join(retired, name)
-        if identity_of_item(candidate) == identity:
-            return candidate
-    return None
+def resolve_item_dir(store_location, rel_path, generation):
+    """Backwards-compatible alias for :func:`resolve_generation`."""
+    return resolve_generation(store_location, rel_path, generation)
 
 
-def retire_item(store_location, rel_path, identity):
+def retire_item(store_location, rel_path, generation):
     """Move a held cache item out of the canonical path, keeping the value.
 
     Must be called while holding the store exclusive lock.  Returns the new
     directory, or ``None`` if the item was already gone or had changed.
     """
     item_path = os.path.join(store_location, rel_path)
-    if identity_of_item(item_path) != identity:
+    if read_generation(item_path) != generation:
+        return None
+    if identity_of_item(item_path) is None:
         return None
     destination = os.path.join(
         _retired_dir(store_location),
@@ -410,7 +598,15 @@ def cleanup_retired(store_location, active_leases=None):
     """
     if active_leases is None:
         active_leases = protected_items(store_location)
-    live_identities = {identity for _, identity in active_leases}
+    live_generations = {generation for _, generation in active_leases if generation}
+    # Leases written by an older version carry no generation; they cannot be
+    # matched by token, so keep every retired copy of their path to remain
+    # compatible instead of deleting something they may still read.
+    legacy_prefixes = tuple(
+        item_key(rel) + "."
+        for rel, generation in active_leases
+        if generation is None and rel is not None
+    )
     retired = _retired_dir(store_location)
     removed = 0
     try:
@@ -418,8 +614,10 @@ def cleanup_retired(store_location, active_leases=None):
     except OSError:
         names = []
     for name in names:
+        if legacy_prefixes and name.startswith(legacy_prefixes):
+            continue
         path = os.path.join(retired, name)
-        if identity_of_item(path) in live_identities:
+        if read_generation(path) in live_generations:
             continue
         shutil.rmtree(path, ignore_errors=True)
         removed += 1
@@ -451,19 +649,22 @@ def remove_holds_root_if_unused(store_location):
 
 
 class ResultHold(object):
-    """Handle keeping a cached result alive.
+    """Handle keeping one *generation* of a cached result alive.
 
     Instances are returned by :meth:`MemorizedResult.pin`.  They expose
     ``get()``, ``close()`` and the context-manager protocol.  A hold can be
     passed as a task argument to :class:`joblib.Parallel`; doing so transfers
     protection to the task without requiring the parent handle to stay open.
+
+    A hold records the generation token captured by ``pin`` and never reads a
+    different generation that later appears at the same ``rel_path``.
     """
 
     def __init__(
         self,
         store_backend,
         rel_path,
-        identity,
+        generation,
         mmap_mode=None,
         verbose=0,
         timestamp=None,
@@ -474,7 +675,7 @@ class ResultHold(object):
         self._backend = store_backend
         self._store_location = os.path.abspath(store_backend.location)
         self._rel_path = rel_path
-        self._identity = tuple(identity)
+        self._generation = generation
         self._mmap_mode = mmap_mode
         self._verbose = verbose
         self._timestamp = timestamp
@@ -496,8 +697,14 @@ class ResultHold(object):
         return os.path.join(self._store_location, self._rel_path)
 
     @property
+    def generation(self):
+        """Opaque token identifying the held generation."""
+        return self._generation
+
+    @property
     def identity(self):
-        return self._identity
+        """Backwards-compatible alias for :attr:`generation`."""
+        return self._generation
 
     def get(self):
         """Load the held value, honouring the result's ``mmap_mode``."""
@@ -507,9 +714,14 @@ class ResultHold(object):
                     "This result hold has been closed; its value is not "
                     "protected anymore."
                 )
+            if self._generation is None:
+                raise ResultUnavailableError(
+                    "This hold does not identify a result generation; it "
+                    "cannot be used to load a value."
+                )
             with store_lock(self._store_location, exclusive=False):
-                item_dir = resolve_item_dir(
-                    self._store_location, self._rel_path, self._identity
+                item_dir = resolve_generation(
+                    self._store_location, self._rel_path, self._generation
                 )
                 if item_dir is None:
                     raise ResultUnavailableError(
@@ -561,14 +773,26 @@ class ResultHold(object):
 
     # -- Parallel support ----------------------------------------------
     def _acquire_lease_locked(self):
-        return create_lease(self._store_location, self._rel_path, self._identity)
+        """Create a lease for this hold; caller holds the store shared lock."""
+        if self._generation is None:
+            raise ResultUnavailableError(
+                "Cannot protect a result that has no generation identity."
+            )
+        return create_lease(self._store_location, self._rel_path, self._generation)
 
     def _reserve(self):
         """Create an independent lease for a task, in the submitting process."""
         require_holds()
+        with self._lock:
+            if self._closed:
+                raise ResultReleasedError(
+                    "Cannot submit a task with a closed result hold. Create a "
+                    "new hold with MemorizedResult.pin() before submitting."
+                )
+            generation = self._generation
         with store_lock(self._store_location, exclusive=False):
-            item_dir = resolve_item_dir(
-                self._store_location, self._rel_path, self._identity
+            item_dir = resolve_generation(
+                self._store_location, self._rel_path, generation
             )
             if item_dir is None:
                 raise ResultUnavailableError(
@@ -593,7 +817,7 @@ class ResultHold(object):
         return ResultHold(
             self._backend,
             self._rel_path,
-            self._identity,
+            self._generation,
             mmap_mode=self._mmap_mode,
             verbose=self._verbose,
             timestamp=self._timestamp,
@@ -613,7 +837,7 @@ class ResultHold(object):
         return {
             "backend": self._backend,
             "rel_path": self._rel_path,
-            "identity": self._identity,
+            "generation": self._generation,
             "mmap_mode": self._mmap_mode,
             "verbose": self._verbose,
             "timestamp": self._timestamp,
@@ -625,7 +849,12 @@ class ResultHold(object):
         self._backend = state["backend"]
         self._store_location = os.path.abspath(self._backend.location)
         self._rel_path = state["rel_path"]
-        self._identity = tuple(state["identity"])
+        # ``identity`` is accepted for holds pickled by an intermediate
+        # version that named the field differently; any value that is not a
+        # generation token is treated as unknown so the handle fails loudly
+        # instead of reading a different generation.
+        generation = state.get("generation", state.get("identity"))
+        self._generation = generation if isinstance(generation, str) else None
         self._mmap_mode = state["mmap_mode"]
         self._verbose = state["verbose"]
         self._timestamp = state["timestamp"]
